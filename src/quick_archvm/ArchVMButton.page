@@ -1,0 +1,125 @@
+Menu="Buttons:99"
+Link="nav-user"
+Title="Arch VM"
+Markdown="false"
+---
+<?
+/* Arch VM plugin - adds an "Add Arch Linux VM" button next to "Add VM" on the
+ * VMs tab. "Buttons" pages are included in every page's <head>, so everything
+ * below is emitted only on the VMs tab while the VM service is running.
+ */
+if (($task ?? '') === 'VMs' && is_file('/var/run/libvirt/libvirtd.pid')):
+  // Read KEY="value" lines the same way quick_archvm.sh does. parse_ini_file()
+  // is not used: since PHP 7 it no longer accepts '#' comments and returns
+  // nothing at all for this file.
+  $quick_archvm_cfg = [];
+  foreach (@file('/boot/config/plugins/quick_archvm/quick_archvm.cfg') ?: [] as $quick_archvm_line) {
+    if (preg_match('/^([A-Z_]+)="?([^"]*?)"?\s*$/', rtrim($quick_archvm_line, "\r\n"), $quick_archvm_m))
+      $quick_archvm_cfg[$quick_archvm_m[1]] = $quick_archvm_m[2];
+  }
+  $quick_archvm_cpus = (int)shell_exec('nproc --all') ?: 1;
+  $quick_archvm_mem  = (int)round(((int)shell_exec("awk '/MemTotal/{print \$2}' /proc/meminfo")) / 1048576);
+  $quick_archvm_names = array_filter(array_map('trim', explode("\n", (string)shell_exec('virsh list --all --name 2>/dev/null'))));
+  $quick_archvm_n = 1;
+  while (in_array("Arch-$quick_archvm_n", $quick_archvm_names, true)) $quick_archvm_n++;
+  $quick_archvm_defaults = [
+    'name'    => "Arch-$quick_archvm_n",
+    'cpus'    => min($quick_archvm_cpus, max(1, (int)($quick_archvm_cfg['DEFAULT_CPUS'] ?? 2))),
+    'memory'  => max(1, (int)($quick_archvm_cfg['DEFAULT_MEMORY_GB'] ?? 4)),
+    'disk'    => max(40, (int)($quick_archvm_cfg['DEFAULT_DISK_GB'] ?? 40)),
+    'pinning' => ($quick_archvm_cfg['CPU_PINNING'] ?? 'auto') === 'none' ? 'none' : 'auto',
+    'sshkey'  => (string)($quick_archvm_cfg['DEFAULT_SSH_KEY'] ?? ''),
+    'maxcpus' => $quick_archvm_cpus,
+    'maxmem'  => max(1, $quick_archvm_mem - 1),
+  ];
+?>
+<style>
+#quick_archvm-dialog dl{display:grid;grid-template-columns:max-content 1fr;gap:10px 14px;align-items:center;margin:0}
+#quick_archvm-dialog dt{text-align:right;font-weight:normal;margin:0}
+#quick_archvm-dialog dd{margin:0}
+#quick_archvm-dialog input[type=text],#quick_archvm-dialog input[type=number],#quick_archvm-dialog select{width:100%;max-width:none;margin:0;box-sizing:border-box}
+#quick_archvm-dialog textarea{width:100%;height:54px;box-sizing:border-box;font-family:monospace;font-size:1.1rem;margin:0}
+#quick_archvm-dialog .hint{font-size:1.1rem;opacity:.7;margin-top:2px}
+#quick_archvm-dialog .quick_archvm-error{color:#e22828;margin-top:12px;min-height:1.2em}
+#quick_archvm-dialog .quick_archvm-info{font-size:1.15rem;opacity:.8;margin:0 0 14px}
+</style>
+<script>
+(function(){
+  var D = <?=json_encode($quick_archvm_defaults, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+
+  function esc(s){ return $('<div>').text(s).html(); }
+
+  function dialogHtml(){
+    return '<div id="quick_archvm-dialog">'
+      +'<p class="quick_archvm-info">Creates a VM from the latest official Arch Linux <i>basic</i> image '
+      +'and installs <b>qemu-guest-agent</b> automatically on first boot. Login: <code>arch</code> / <code>arch</code></p>'
+      +'<dl>'
+      +'<dt>Name:</dt><dd><input type="text" id="quick_archvm-name" maxlength="63" value="'+esc(D.name)+'"></dd>'
+      +'<dt>CPUs:</dt><dd><input type="number" id="quick_archvm-cpus" min="1" max="'+D.maxcpus+'" value="'+D.cpus+'">'
+      +'<div class="hint">host has '+D.maxcpus+' logical CPUs</div></dd>'
+      +'<dt>Memory (GiB):</dt><dd><input type="number" id="quick_archvm-memory" min="1" max="'+D.maxmem+'" value="'+D.memory+'"></dd>'
+      +'<dt>Disk size (GiB):</dt><dd><input type="number" id="quick_archvm-disk" min="40" value="'+D.disk+'">'
+      +'<div class="hint">minimum 40, thin provisioned; the root filesystem grows automatically</div></dd>'
+      +'<dt>CPU pinning:</dt><dd><select id="quick_archvm-pinning">'
+      +'<option value="auto"'+(D.pinning=='auto'?' selected':'')+'>Automatic (whole cores, avoid core 0)</option>'
+      +'<option value="none"'+(D.pinning=='none'?' selected':'')+'>None (float on all CPUs)</option>'
+      +'</select></dd>'
+      +'<dt>SSH public key:</dt><dd><textarea id="quick_archvm-sshkey" spellcheck="false" placeholder="optional - ssh-ed25519 AAAA... you@host">'+esc(D.sshkey)+'</textarea></dd>'
+      +'<dt>Start VM:</dt><dd><label><input type="checkbox" id="quick_archvm-start" checked> start after creation</label></dd>'
+      +'</dl>'
+      +'<div class="quick_archvm-error"></div>'
+      +'</div>';
+  }
+
+  function openDialog(){
+    $('#quick_archvm-dialog').remove();
+    var box = $(dialogHtml()).appendTo('body');
+    var err = box.find('.quick_archvm-error');
+    box.dialog({
+      title: 'Add Arch Linux VM',
+      width: Math.min(620, $(window).width()-20),
+      height: 'auto',
+      modal: true,
+      resizable: false,
+      close: function(){ box.dialog('destroy').remove(); },
+      buttons: {
+        'Create': function(){
+          var data = {
+            action:  'prepare',
+            name:    $.trim(box.find('#quick_archvm-name').val()),
+            cpus:    box.find('#quick_archvm-cpus').val(),
+            memory:  box.find('#quick_archvm-memory').val(),
+            disk:    box.find('#quick_archvm-disk').val(),
+            pinning: box.find('#quick_archvm-pinning').val(),
+            sshkey:  $.trim(box.find('#quick_archvm-sshkey').val()),
+            start:   box.find('#quick_archvm-start').prop('checked') ? 'yes' : 'no'
+          };
+          if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$/.test(data.name)) { err.text('Invalid name: letters, digits, space, . _ - only.'); return; }
+          if (+data.disk < 40) { err.text('Disk size must be at least 40 GiB.'); return; }
+          err.text('');
+          var btns = box.parent().find('.ui-dialog-buttonpane button').prop('disabled', true);
+          $.post('/plugins/quick_archvm/include/ArchVM.php', data, function(res){
+            box.dialog('close');
+            var done = (typeof loadlist === 'function') ? 'loadlist' : '';
+            openPlugin('quick_archvm_create ' + res.id, 'Create Arch VM: ' + data.name, 'quick_archvm', done);
+          }, 'json').fail(function(x){
+            btns.prop('disabled', false);
+            err.text((x.responseJSON && x.responseJSON.error) || ('Request failed (' + x.status + ')'));
+          });
+        },
+        'Cancel': function(){ box.dialog('close'); }
+      }
+    });
+    if (typeof dialogStyle === 'function') dialogStyle();
+    box.find('#quick_archvm-name').focus().select();
+  }
+
+  $(function(){
+    var add = $('#btnAddVM');
+    if (!add.length || $('#btnAddArchVM').length) return;
+    var btn = $('<input type="button" id="btnAddArchVM" value="Add Arch Linux VM" title="Create an Arch Linux VM from the official basic image, with qemu-guest-agent">');
+    btn.css('display', add.css('display')).on('click', openDialog).insertAfter(add);
+  });
+})();
+</script>
+<? endif; ?>

@@ -1,0 +1,15 @@
+# editor / OS files
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# local test output
+/tmp/
+*.log
+
+# disk images never belong in the repo
+*.qcow2
+*.img
+*.raw

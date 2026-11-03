@@ -1,0 +1,937 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "quick_archvm">
+<!ENTITY author    "Modac">
+<!ENTITY version   "2026.11.03e">
+<!ENTITY launch    "VMs">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/Modac/unraid-quick_archvm/main/quick_archvm.plg">
+<!ENTITY support   "https://github.com/Modac/unraid-quick_archvm/issues">
+<!ENTITY plugdir   "/usr/local/emhttp/plugins/quick_archvm">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;"
+        pluginURL="&pluginURL;" support="&support;" icon="linux" min="6.12.0">
+
+<CHANGES><![CDATA[
+### 2026.11.03e
+- Repository setup: build script with automatic versions and changelog,
+  test suite, GitHub Actions CI. No change in behaviour.
+- Fix: XML escaping was broken on bash 5.2+ (Unraid 7). A storage path
+  containing ' or & produced an invalid VM definition.
+- Uninstall also removes the lock file.
+
+### 2026.11.03d
+- Report the VM's real IP address after creation instead of 127.0.0.1
+  (skip loopback, match the VM's own network card, wait up to 60 s for DHCP).
+
+### 2026.11.03c
+- Fix: dialog ignored the defaults in quick_archvm.cfg (PHP's INI parser
+  rejects the file's '#' comment lines).
+
+### 2026.11.03b
+- Fix: unquoted settings in a cfg edited from Windows (CRLF line endings)
+  got an invisible extra character.
+
+### 2026.11.03a
+- Add the qemu-vdagent clipboard channel to new VMs.
+
+### 2026.11.03
+- Show system error messages in the progress window (were hidden).
+- Never reuse a MAC address of an existing VM.
+- Show libvirt's real error when the new VM fails to start.
+
+### 2026.11.02
+- First release: "Add Arch Linux VM" button on the VMs tab. Creates a VM from
+  the latest official Arch Linux basic image; on first boot the guest sets its
+  hostname, grows its root filesystem, adds an optional SSH key and installs
+  qemu-guest-agent if missing.
+]]></CHANGES>
+
+<!-- remove files of a previous version -->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf &plugdir;
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/quick_archvm/ArchVMButton.page">
+<INLINE><![CDATA[
+Menu="Buttons:99"
+Link="nav-user"
+Title="Arch VM"
+Markdown="false"
+---
+<?
+/* Arch VM plugin - adds an "Add Arch Linux VM" button next to "Add VM" on the
+ * VMs tab. "Buttons" pages are included in every page's <head>, so everything
+ * below is emitted only on the VMs tab while the VM service is running.
+ */
+if (($task ?? '') === 'VMs' && is_file('/var/run/libvirt/libvirtd.pid')):
+  // Read KEY="value" lines the same way quick_archvm.sh does. parse_ini_file()
+  // is not used: since PHP 7 it no longer accepts '#' comments and returns
+  // nothing at all for this file.
+  $quick_archvm_cfg = [];
+  foreach (@file('/boot/config/plugins/quick_archvm/quick_archvm.cfg') ?: [] as $quick_archvm_line) {
+    if (preg_match('/^([A-Z_]+)="?([^"]*?)"?\s*$/', rtrim($quick_archvm_line, "\r\n"), $quick_archvm_m))
+      $quick_archvm_cfg[$quick_archvm_m[1]] = $quick_archvm_m[2];
+  }
+  $quick_archvm_cpus = (int)shell_exec('nproc --all') ?: 1;
+  $quick_archvm_mem  = (int)round(((int)shell_exec("awk '/MemTotal/{print \$2}' /proc/meminfo")) / 1048576);
+  $quick_archvm_names = array_filter(array_map('trim', explode("\n", (string)shell_exec('virsh list --all --name 2>/dev/null'))));
+  $quick_archvm_n = 1;
+  while (in_array("Arch-$quick_archvm_n", $quick_archvm_names, true)) $quick_archvm_n++;
+  $quick_archvm_defaults = [
+    'name'    => "Arch-$quick_archvm_n",
+    'cpus'    => min($quick_archvm_cpus, max(1, (int)($quick_archvm_cfg['DEFAULT_CPUS'] ?? 2))),
+    'memory'  => max(1, (int)($quick_archvm_cfg['DEFAULT_MEMORY_GB'] ?? 4)),
+    'disk'    => max(40, (int)($quick_archvm_cfg['DEFAULT_DISK_GB'] ?? 40)),
+    'pinning' => ($quick_archvm_cfg['CPU_PINNING'] ?? 'auto') === 'none' ? 'none' : 'auto',
+    'sshkey'  => (string)($quick_archvm_cfg['DEFAULT_SSH_KEY'] ?? ''),
+    'maxcpus' => $quick_archvm_cpus,
+    'maxmem'  => max(1, $quick_archvm_mem - 1),
+  ];
+?>
+<style>
+#quick_archvm-dialog dl{display:grid;grid-template-columns:max-content 1fr;gap:10px 14px;align-items:center;margin:0}
+#quick_archvm-dialog dt{text-align:right;font-weight:normal;margin:0}
+#quick_archvm-dialog dd{margin:0}
+#quick_archvm-dialog input[type=text],#quick_archvm-dialog input[type=number],#quick_archvm-dialog select{width:100%;max-width:none;margin:0;box-sizing:border-box}
+#quick_archvm-dialog textarea{width:100%;height:54px;box-sizing:border-box;font-family:monospace;font-size:1.1rem;margin:0}
+#quick_archvm-dialog .hint{font-size:1.1rem;opacity:.7;margin-top:2px}
+#quick_archvm-dialog .quick_archvm-error{color:#e22828;margin-top:12px;min-height:1.2em}
+#quick_archvm-dialog .quick_archvm-info{font-size:1.15rem;opacity:.8;margin:0 0 14px}
+</style>
+<script>
+(function(){
+  var D = <?=json_encode($quick_archvm_defaults, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+
+  function esc(s){ return $('<div>').text(s).html(); }
+
+  function dialogHtml(){
+    return '<div id="quick_archvm-dialog">'
+      +'<p class="quick_archvm-info">Creates a VM from the latest official Arch Linux <i>basic</i> image '
+      +'and installs <b>qemu-guest-agent</b> automatically on first boot. Login: <code>arch</code> / <code>arch</code></p>'
+      +'<dl>'
+      +'<dt>Name:</dt><dd><input type="text" id="quick_archvm-name" maxlength="63" value="'+esc(D.name)+'"></dd>'
+      +'<dt>CPUs:</dt><dd><input type="number" id="quick_archvm-cpus" min="1" max="'+D.maxcpus+'" value="'+D.cpus+'">'
+      +'<div class="hint">host has '+D.maxcpus+' logical CPUs</div></dd>'
+      +'<dt>Memory (GiB):</dt><dd><input type="number" id="quick_archvm-memory" min="1" max="'+D.maxmem+'" value="'+D.memory+'"></dd>'
+      +'<dt>Disk size (GiB):</dt><dd><input type="number" id="quick_archvm-disk" min="40" value="'+D.disk+'">'
+      +'<div class="hint">minimum 40, thin provisioned; the root filesystem grows automatically</div></dd>'
+      +'<dt>CPU pinning:</dt><dd><select id="quick_archvm-pinning">'
+      +'<option value="auto"'+(D.pinning=='auto'?' selected':'')+'>Automatic (whole cores, avoid core 0)</option>'
+      +'<option value="none"'+(D.pinning=='none'?' selected':'')+'>None (float on all CPUs)</option>'
+      +'</select></dd>'
+      +'<dt>SSH public key:</dt><dd><textarea id="quick_archvm-sshkey" spellcheck="false" placeholder="optional - ssh-ed25519 AAAA... you@host">'+esc(D.sshkey)+'</textarea></dd>'
+      +'<dt>Start VM:</dt><dd><label><input type="checkbox" id="quick_archvm-start" checked> start after creation</label></dd>'
+      +'</dl>'
+      +'<div class="quick_archvm-error"></div>'
+      +'</div>';
+  }
+
+  function openDialog(){
+    $('#quick_archvm-dialog').remove();
+    var box = $(dialogHtml()).appendTo('body');
+    var err = box.find('.quick_archvm-error');
+    box.dialog({
+      title: 'Add Arch Linux VM',
+      width: Math.min(620, $(window).width()-20),
+      height: 'auto',
+      modal: true,
+      resizable: false,
+      close: function(){ box.dialog('destroy').remove(); },
+      buttons: {
+        'Create': function(){
+          var data = {
+            action:  'prepare',
+            name:    $.trim(box.find('#quick_archvm-name').val()),
+            cpus:    box.find('#quick_archvm-cpus').val(),
+            memory:  box.find('#quick_archvm-memory').val(),
+            disk:    box.find('#quick_archvm-disk').val(),
+            pinning: box.find('#quick_archvm-pinning').val(),
+            sshkey:  $.trim(box.find('#quick_archvm-sshkey').val()),
+            start:   box.find('#quick_archvm-start').prop('checked') ? 'yes' : 'no'
+          };
+          if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$/.test(data.name)) { err.text('Invalid name: letters, digits, space, . _ - only.'); return; }
+          if (+data.disk < 40) { err.text('Disk size must be at least 40 GiB.'); return; }
+          err.text('');
+          var btns = box.parent().find('.ui-dialog-buttonpane button').prop('disabled', true);
+          $.post('/plugins/quick_archvm/include/ArchVM.php', data, function(res){
+            box.dialog('close');
+            var done = (typeof loadlist === 'function') ? 'loadlist' : '';
+            openPlugin('quick_archvm_create ' + res.id, 'Create Arch VM: ' + data.name, 'quick_archvm', done);
+          }, 'json').fail(function(x){
+            btns.prop('disabled', false);
+            err.text((x.responseJSON && x.responseJSON.error) || ('Request failed (' + x.status + ')'));
+          });
+        },
+        'Cancel': function(){ box.dialog('close'); }
+      }
+    });
+    if (typeof dialogStyle === 'function') dialogStyle();
+    box.find('#quick_archvm-name').focus().select();
+  }
+
+  $(function(){
+    var add = $('#btnAddVM');
+    if (!add.length || $('#btnAddArchVM').length) return;
+    var btn = $('<input type="button" id="btnAddArchVM" value="Add Arch Linux VM" title="Create an Arch Linux VM from the official basic image, with qemu-guest-agent">');
+    btn.css('display', add.css('display')).on('click', openDialog).insertAfter(add);
+  });
+})();
+</script>
+<? endif; ?>
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/quick_archvm/include/ArchVM.php">
+<INLINE><![CDATA[
+<?PHP
+/* Arch VM plugin - AJAX endpoint.
+ *
+ * POST action=prepare : validate the dialog input, store it as a job file and
+ *                       return its id. The web UI then starts
+ *                       scripts/quick_archvm_create <id> through openPlugin().
+ *
+ * The job file indirection means no user input ever travels through the
+ * command line that Unraid's task runner builds; only a hex id does.
+ * CSRF is enforced by Unraid for every POST (csrf_token is added by the UI).
+ */
+header('Content-Type: application/json');
+
+function reply($data, $code = 200) {
+  http_response_code($code);
+  echo json_encode($data);
+  exit;
+}
+function fail($msg) { reply(['error' => $msg], 400); }
+
+if (($_POST['action'] ?? '') !== 'prepare') fail('unknown action');
+
+$name    = trim($_POST['name'] ?? '');
+$cpus    = $_POST['cpus'] ?? '';
+$memory  = $_POST['memory'] ?? '';
+$disk    = $_POST['disk'] ?? '';
+$pinning = $_POST['pinning'] ?? 'auto';
+$sshkey  = trim(str_replace("\r", '', $_POST['sshkey'] ?? ''));
+$start   = ($_POST['start'] ?? '') === 'yes';
+
+if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$/', $name))
+  fail('Invalid name: use letters, digits, space, dot, underscore or dash (max 63 characters).');
+if (!ctype_digit((string)$cpus) || $cpus < 1 || $cpus > (int)shell_exec('nproc --all'))
+  fail('Invalid number of CPUs.');
+if (!ctype_digit((string)$memory) || $memory < 1)
+  fail('Invalid memory size.');
+if (!ctype_digit((string)$disk) || $disk < 40)
+  fail('Disk size must be at least 40 GiB (the size of the Arch image).');
+if (!in_array($pinning, ['auto', 'none'], true))
+  fail('Invalid CPU pinning option.');
+if ($sshkey !== '' && (strpos($sshkey, "\n") !== false ||
+    !preg_match('/^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]+ [A-Za-z0-9+\/=]+( .*)?$/', $sshkey)))
+  fail('The SSH key must be a single OpenSSH public key line (ssh-ed25519 AAAA... comment).');
+
+exec('virsh dominfo '.escapeshellarg($name).' 2>/dev/null', $out, $rc);
+if ($rc === 0) fail("A VM named '$name' already exists.");
+
+$jobdir = '/tmp/quick_archvm/jobs';
+if (!is_dir($jobdir)) mkdir($jobdir, 0700, true);
+foreach (glob("$jobdir/*.json") as $old) if (filemtime($old) < time() - 3600) @unlink($old);
+
+$id = bin2hex(random_bytes(8));
+$job = [
+  'name' => $name, 'cpus' => (int)$cpus, 'memory' => (int)$memory, 'disk' => (int)$disk,
+  'pinning' => $pinning, 'sshkey' => $sshkey, 'start' => $start,
+];
+if (file_put_contents("$jobdir/$id.json", json_encode($job)) === false) fail('Could not write job file.');
+chmod("$jobdir/$id.json", 0600);
+reply(['id' => $id]);
+?>
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/quick_archvm/include/guest-provision.sh">
+<INLINE><![CDATA[
+#!/bin/bash
+# Arch VM first-boot provisioning (runs INSIDE the guest).
+#
+# This script never touches the Unraid host. It is handed to the guest as a
+# systemd credential via SMBIOS OEM strings (see quick_archvm.sh) and run by
+# quick_archvm-provision.service, which systemd creates from the credential
+# "systemd.extra-unit.quick_archvm-provision.service".
+#
+# It runs once: on success it writes /var/lib/quick_archvm/provisioned and the unit
+# is skipped from then on. If it fails (no network yet, mirror down, ...) it
+# retries every 30 seconds and again on the next boot.
+
+set -uo pipefail
+
+CRED="${CREDENTIALS_DIRECTORY:-/run/credentials/quick_archvm-provision.service}"
+log() { echo "quick_archvm-provision: $*"; }
+
+# 1. Hostname (taken from the VM name)
+if [[ -s "$CRED/quick_archvm.hostname" ]]; then
+  # systemd already applied it at boot (system.hostname credential); persist
+  # it in /etc/hostname so it survives the credentials being removed later
+  name=$(<"$CRED/quick_archvm.hostname")
+  log "setting hostname to $name"
+  printf '%s\n' "$name" >/etc/hostname
+  hostnamectl hostname "$name" || log "WARNING: could not set hostname"
+fi
+
+# 2. Optional SSH public key for the default 'arch' user
+if [[ -s "$CRED/quick_archvm.ssh-key" ]] && id arch &>/dev/null; then
+  home=$(getent passwd arch | cut -d: -f6)
+  install -d -m 700 -o arch -g arch "$home/.ssh"
+  touch "$home/.ssh/authorized_keys"
+  key=$(<"$CRED/quick_archvm.ssh-key")
+  if ! grep -qxF "$key" "$home/.ssh/authorized_keys"; then
+    log "adding SSH key for user arch"
+    printf '%s\n' "$key" >>"$home/.ssh/authorized_keys"
+  fi
+  chown arch:arch "$home/.ssh/authorized_keys"
+  chmod 600 "$home/.ssh/authorized_keys"
+fi
+
+# 3. Grow the root partition + filesystem to the full virtual disk size
+#    (the image is 40 GiB; the vdisk may have been created larger).
+grow_root() {
+  local src dev part disk num fstype
+  src=$(findmnt -no SOURCE / | sed 's/\[.*\]$//')        # /dev/vda3 (strip btrfs [/subvol])
+  dev=$(basename "$src")
+  part=/sys/class/block/$dev/partition
+  [[ -r $part ]] || { log "root is not on a partition, not growing"; return 0; }
+  num=$(<"$part")
+  disk=/dev/$(lsblk -no PKNAME "$src" | head -n1)
+  fstype=$(findmnt -no FSTYPE /)
+  # move the backup GPT header to the (new) end of the disk, then grow
+  sfdisk --relocate gpt-bak-std "$disk" &>/dev/null || true
+  if echo ', +' | sfdisk --no-reread --no-tell-kernel -q -N "$num" "$disk" &>/dev/null; then
+    partx -u -n "$num" "$disk" || true
+  fi
+  case $fstype in
+    btrfs) btrfs filesystem resize max / >/dev/null ;;
+    ext4)  resize2fs "$src" >/dev/null ;;
+    xfs)   xfs_growfs / >/dev/null ;;
+  esac
+  log "root filesystem: $(df -h --output=size / | tail -n1 | tr -d ' ')"
+}
+grow_root || log "WARNING: could not grow the root filesystem"
+
+# 4. qemu-guest-agent: recent official images already ship it, older ones
+#    don't. Install it only when it is missing.
+if ! pacman -Q qemu-guest-agent &>/dev/null; then
+  # wait for working DNS (network-online.target is not always enough)
+  for _ in $(seq 1 60); do
+    getent hosts archlinux.org &>/dev/null && break
+    sleep 2
+  done
+  # pacman keyring (normally done by the image's own pacman-init.service)
+  if [[ ! -s /etc/pacman.d/gnupg/pubring.gpg && ! -s /etc/pacman.d/gnupg/pubring.kbx ]]; then
+    log "initialising pacman keyring"
+    pacman-key --init && pacman-key --populate archlinux || exit 1
+  fi
+  # refresh the keyring first (avoids signature errors on older images), then
+  # do a full upgrade together with the install (Arch does not support
+  # partial upgrades)
+  log "refreshing archlinux-keyring"
+  pacman -Sy --noconfirm --needed archlinux-keyring || exit 1
+  log "upgrading system and installing qemu-guest-agent"
+  pacman -Su --noconfirm --needed qemu-guest-agent || exit 1
+else
+  log "qemu-guest-agent is already installed"
+fi
+
+# 5. Make sure the agent runs now and on every boot. The package's udev rule
+#    starts it when the virtio channel appears; enabling is a no-op for a
+#    static unit but covers future packaging changes.
+systemctl enable qemu-guest-agent.service &>/dev/null || true
+udevadm trigger --subsystem-match=virtio-ports --action=add &>/dev/null || true
+systemctl start qemu-guest-agent.service || log "WARNING: qemu-guest-agent did not start"
+
+mkdir -p /var/lib/quick_archvm
+date -Is >/var/lib/quick_archvm/provisioned
+log "done"
+exit 0
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/quick_archvm/scripts/quick_archvm.sh">
+<INLINE><![CDATA[
+#!/bin/bash
+# quick_archvm.sh - create an Arch Linux VM on Unraid from the official
+# Arch Linux "basic" cloud image, with qemu-guest-agent installed on first boot.
+#
+# Usage:
+#   quick_archvm.sh --name NAME [--cpus N] [--memory-gb N] [--disk-gb N]
+#                    [--pinning auto|none] [--ssh-key "ssh-ed25519 ..."]
+#                    [--start] [--dry-run]
+#
+# Called by the web UI (via scripts/quick_archvm_create), but works from a shell too.
+
+set -uo pipefail
+umask 022
+
+PLUGIN=quick_archvm
+PLUGIN_DIR=/usr/local/emhttp/plugins/$PLUGIN
+# the two config paths can be overridden for tests (tests/run.sh)
+CFG_FILE=${QUICK_ARCHVM_CFG:-/boot/config/plugins/$PLUGIN/$PLUGIN.cfg}
+DOMAIN_CFG=${QUICK_ARCHVM_DOMAIN_CFG:-/boot/config/domain.cfg}
+NVRAM_DIR=/etc/libvirt/qemu/nvram
+OVMF_CODE=/usr/share/qemu/ovmf-x64/OVMF_CODE-pure-efi.fd
+OVMF_VARS=/usr/share/qemu/ovmf-x64/OVMF_VARS-pure-efi.fd
+LOCK=/var/run/$PLUGIN.lock
+MIN_DISK_GB=40   # virtual size of the official image; shrinking is not supported
+
+# ---------------------------------------------------------------- helpers ---
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+die()  { printf '\nERROR: %s\n' "$*"; exit 1; }
+
+# read KEY="value" from a cfg file without sourcing it
+cfg_get() { # file key default
+  local v
+  # tr strips Windows line endings (file edited over the flash share)
+  v=$({ tr -d '\r' <"$1"; } 2>/dev/null | sed -n "s/^$2=\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" | tail -n1)
+  printf '%s' "${v:-$3}"
+}
+
+xml_escape() {
+  local s=$1
+  # replacements are quoted: since bash 5.2 an unquoted '&' in the replacement
+  # means "the matched text" (patsub_replacement), which breaks the escaping
+  s=${s//&/"&amp;"}; s=${s//</"&lt;"}; s=${s//>/"&gt;"}; s=${s//\"/"&quot;"}; s=${s//\'/"&apos;"}
+  printf '%s' "$s"
+}
+
+b64() { base64 -w0; }
+
+# Pick the VM's IPv4 address from "virsh domifaddr --source agent" output.
+# Prefers the interface with the VM's own MAC ($1); otherwise any address that
+# is not loopback (127.x) or link-local (169.254.x). Lines that continue an
+# interface (extra addresses) show "-" in the name and MAC columns.
+vm_ipv4() {
+  awk -v mac="$(tr 'A-F' 'a-f' <<<"$1")" '
+    NR <= 2 { next }                                  # header + separator
+    { if ($2 != "-") cur = tolower($2) }
+    $3 == "ipv4" {
+      split($4, a, "/"); ip = a[1]
+      if (ip ~ /^127\./ || ip ~ /^169\.254\./) next
+      if (cur == mac && own == "") own = ip
+      if (any == "") any = ip
+    }
+    END { print (own != "" ? own : any) }'
+}
+
+# tests/run.sh sources the script with this set to get only the helpers above
+[[ ${QUICK_ARCHVM_SOURCE_ONLY:-} == 1 ]] && return 0
+
+# ------------------------------------------------------------- arguments ---
+NAME="" CPUS="" MEM_GB="" DISK_GB="" PINNING="" SSH_KEY="" START=no DRYRUN=no
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --name)      NAME=${2-};    shift 2 ;;
+    --cpus)      CPUS=${2-};    shift 2 ;;
+    --memory-gb) MEM_GB=${2-};  shift 2 ;;
+    --disk-gb)   DISK_GB=${2-}; shift 2 ;;
+    --pinning)   PINNING=${2-}; shift 2 ;;
+    --ssh-key)   SSH_KEY=${2-}; shift 2 ;;
+    --start)     START=yes;     shift ;;
+    --dry-run)   DRYRUN=yes;    shift ;;
+    -h|--help)   sed -n '2,12p' "$0"; exit 0 ;;
+    *)           die "unknown argument: $1" ;;
+  esac
+done
+
+# --------------------------------------------------------------- config ---
+IMAGE_URL=$(cfg_get "$CFG_FILE" IMAGE_URL "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-basic.qcow2")
+DOMAINDIR=$(cfg_get "$DOMAIN_CFG" DOMAINDIR "/mnt/user/domains/")
+VM_DIR=$(cfg_get "$CFG_FILE" VM_DIR "$DOMAINDIR")
+VM_DIR=${VM_DIR%/}
+CACHE_DIR=$(cfg_get "$CFG_FILE" CACHE_DIR "$VM_DIR/.quick_archvm-cache")
+CACHE_DIR=${CACHE_DIR%/}
+BRIDGE=$(cfg_get "$CFG_FILE" BRIDGE "$(cfg_get "$DOMAIN_CFG" BRNAME virbr0)")
+KEYMAP=$(cfg_get "$CFG_FILE" KEYMAP "")
+CPUS=${CPUS:-$(cfg_get "$CFG_FILE" DEFAULT_CPUS 2)}
+MEM_GB=${MEM_GB:-$(cfg_get "$CFG_FILE" DEFAULT_MEMORY_GB 4)}
+DISK_GB=${DISK_GB:-$(cfg_get "$CFG_FILE" DEFAULT_DISK_GB $MIN_DISK_GB)}
+PINNING=${PINNING:-$(cfg_get "$CFG_FILE" CPU_PINNING auto)}
+[[ $DRYRUN == yes ]] && { VM_DIR=${QUICK_ARCHVM_TEST_DIR:-/tmp/quick_archvm-dryrun}; CACHE_DIR=$VM_DIR/.quick_archvm-cache; }
+
+# ----------------------------------------------------------- validation ---
+[[ $NAME =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]{0,62}$ ]] ||
+  die "invalid VM name '$NAME' (letters, digits, space, . _ - ; max 63 chars)"
+{ [[ $CPUS =~ ^[0-9]+$ ]] && (( CPUS >= 1 )); } || die "invalid CPU count '$CPUS'"
+{ [[ $MEM_GB =~ ^[0-9]+$ ]] && (( MEM_GB >= 1 )); } || die "invalid memory size '$MEM_GB' GiB"
+[[ $DISK_GB =~ ^[0-9]+$ ]] || die "invalid disk size '$DISK_GB' GiB"
+(( DISK_GB >= MIN_DISK_GB )) || die "disk size must be at least ${MIN_DISK_GB} GiB (size of the Arch image)"
+[[ $PINNING == auto || $PINNING == none ]] || die "--pinning must be 'auto' or 'none'"
+if [[ -n $SSH_KEY ]]; then
+  SSH_KEY=$(printf '%s' "$SSH_KEY" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [[ $SSH_KEY != *$'\n'* && $SSH_KEY =~ ^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]+\ [A-Za-z0-9+/=]+(\ .*)?$ ]] ||
+    die "the SSH key does not look like a single OpenSSH public key line"
+fi
+
+HOST_CPUS=$(nproc --all)
+(( CPUS <= HOST_CPUS )) || die "requested $CPUS vCPUs but the host only has $HOST_CPUS"
+HOST_MEM_GB=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 / 1024 ))
+(( MEM_GB < HOST_MEM_GB )) || die "requested ${MEM_GB} GiB RAM but the host only has ~${HOST_MEM_GB} GiB"
+
+# guest hostname derived from the VM name
+HOSTNAME_G=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g;s/--*/-/g;s/^-//;s/-$//' | cut -c1-63)
+HOSTNAME_G=${HOSTNAME_G%-}; HOSTNAME_G=${HOSTNAME_G:-arch}
+
+if [[ $DRYRUN == no ]]; then
+  { command -v virsh >/dev/null && [[ -e /var/run/libvirt/libvirtd.pid ]]; } ||
+    die "the VM service (libvirt) is not running - enable it under Settings > VM Manager"
+  virsh dominfo "$NAME" &>/dev/null && die "a VM named '$NAME' already exists"
+  [[ -r $OVMF_VARS && -r $OVMF_CODE ]] || die "OVMF firmware not found in /usr/share/qemu/ovmf-x64"
+  [[ -d ${VM_DIR} ]] || die "VM storage path '$VM_DIR' does not exist (check Settings > VM Manager)"
+fi
+
+VDISK_DIR="$VM_DIR/$NAME"
+VDISK="$VDISK_DIR/vdisk1.qcow2"
+[[ -e $VDISK ]] && die "'$VDISK' already exists - remove it or choose another name"
+
+# the braces keep 2>/dev/null to this one exec; a bare "exec ... 2>/dev/null"
+# would silence stderr for the rest of the script
+{ exec 9>"$LOCK"; } 2>/dev/null || exec 9>/dev/null
+flock -n 9 || die "another Arch VM is being created right now - try again when it has finished"
+
+# cleanup on failure
+CREATED_DISK="" CREATED_DIR="" CREATED_NVRAM="" DEFINED=""
+# shellcheck disable=SC2317  # only called via trap
+cleanup() {
+  local rc=$?
+  if (( rc != 0 )) && [[ -z $DEFINED ]]; then
+    [[ -n $CREATED_DISK  ]] && rm -f -- "$CREATED_DISK"
+    [[ -n $CREATED_NVRAM ]] && rm -f -- "$CREATED_NVRAM"
+    [[ -n $CREATED_DIR   ]] && rmdir -- "$CREATED_DIR" 2>/dev/null
+    rm -f -- "${CACHE_DIR}/.download.part"
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'die "interrupted"' INT TERM
+
+say "Creating Arch Linux VM '$NAME'"
+say "  vCPUs: $CPUS   RAM: ${MEM_GB} GiB   disk: ${DISK_GB} GiB   network: $BRIDGE"
+say "  location: $VDISK_DIR"
+
+# ---------------------------------------------------------- base image ---
+step "Checking for the latest Arch Linux basic image"
+mkdir -p -- "$CACHE_DIR" || die "cannot create cache directory $CACHE_DIR"
+CACHED="$CACHE_DIR/$(basename "$IMAGE_URL")"
+REMOTE_SHA=$(curl -fsSL --retry 3 --connect-timeout 15 "$IMAGE_URL.SHA256" | awk '{print $1}')
+LOCAL_SHA=$(cat -- "$CACHED.sha256" 2>/dev/null)
+if [[ ! $REMOTE_SHA =~ ^[0-9a-f]{64}$ ]]; then
+  [[ -s $CACHED && -n $LOCAL_SHA ]] || die "could not reach $IMAGE_URL.SHA256 and no cached image exists"
+  say "WARNING: could not check for updates, using cached image"
+elif [[ -s $CACHED && $LOCAL_SHA == "$REMOTE_SHA" ]]; then
+  say "cached image is up to date"
+else
+  say "downloading $IMAGE_URL"
+  # --progress-bar writes \r-terminated updates which the web UI renders in place
+  curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "$CACHE_DIR/.download.part" "$IMAGE_URL" 2>&1 |
+    tr '\r' '\n' | awk '/%/{ if (int($NF) >= last+5 || $NF ~ /100/) { printf "  %s\r", $NF; last=int($NF) } } END{ print "" }'
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || die "download failed"
+  say "verifying checksum"
+  GOT=$(sha256sum "$CACHE_DIR/.download.part" | awk '{print $1}')
+  [[ $GOT == "$REMOTE_SHA" ]] || die "checksum mismatch (expected $REMOTE_SHA, got $GOT)"
+  mv -f -- "$CACHE_DIR/.download.part" "$CACHED" && printf '%s\n' "$REMOTE_SHA" >"$CACHED.sha256"
+  say "image cached at $CACHED"
+fi
+IMG_VERSION=$(curl -fsSL --connect-timeout 10 "$(dirname "$IMAGE_URL")/" 2>/dev/null |
+  grep -o 'Arch-Linux-x86_64-basic-[0-9.]*\.qcow2"' | head -n1 | sed 's/.*basic-\([0-9]*\)\..*/\1/')
+
+# ---------------------------------------------------------------- vdisk ---
+step "Creating virtual disk"
+[[ -d $VDISK_DIR ]] || { mkdir -p -- "$VDISK_DIR" || die "cannot create $VDISK_DIR"; CREATED_DIR=$VDISK_DIR; }
+CREATED_DISK=$VDISK
+qemu-img convert -p -O qcow2 -o preallocation=off -- "$CACHED" "$VDISK" 2>&1 |
+  tr '\r' '\n' | awk '/%\)/{ gsub(/[()]/,""); v=int($1); if (v >= last+10 && v < 100) { printf "  %d%%\r", v; last=v } } END{ print "  100%" }'
+[[ ${PIPESTATUS[0]} -eq 0 ]] || die "qemu-img convert failed"
+if (( DISK_GB > MIN_DISK_GB )); then
+  qemu-img resize -q -- "$VDISK" "${DISK_GB}G" || die "qemu-img resize failed"
+fi
+say "created $VDISK (${DISK_GB} GiB, thin provisioned)"
+
+# -------------------------------------------------------- CPU selection ---
+# Returns the host CPUs to pin to. "auto" prefers whole physical cores
+# (hyperthread pairs), starting from the highest core, and leaves core 0
+# (which Unraid itself uses most) free whenever possible.
+PINS=() THREADS=1
+expand_cpulist() { # "0-3,8" -> "0 1 2 3 8"
+  local out=() p parts
+  IFS=, read -ra parts <<<"$1"
+  for p in "${parts[@]}"; do
+    [[ -z $p ]] && continue
+    if [[ $p == *-* ]]; then mapfile -t -O "${#out[@]}" out < <(seq "${p%-*}" "${p#*-}"); else out+=("$p"); fi
+  done
+  echo "${out[*]}"
+}
+if [[ $PINNING == auto && -r /sys/devices/system/cpu/cpu0/topology/thread_siblings_list ]]; then
+  declare -A SEEN=()
+  CORES=()
+  for f in /sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list; do
+    l=$(<"$f"); [[ -n ${SEEN[$l]:-} ]] && continue; SEEN[$l]=1
+    CORES+=("$(expand_cpulist "$l")")
+  done
+  mapfile -t CORES < <(printf '%s\n' "${CORES[@]}" | sort -n -k1,1)
+  ISOLATED=" $(expand_cpulist "$(cat /sys/devices/system/cpu/isolated 2>/dev/null)") "
+  TPC=$(wc -w <<<"${CORES[0]}")   # threads per core
+  # order: isolated cores (highest first), other cores (highest first), core 0 last
+  ISO=() REST=()
+  for (( i=${#CORES[@]}-1; i>=1; i-- )); do
+    first=${CORES[$i]%% *}
+    if [[ $ISOLATED == *" $first "* ]]; then ISO+=("${CORES[$i]}"); else REST+=("${CORES[$i]}"); fi
+  done
+  for c in "${ISO[@]}" "${REST[@]}" "${CORES[0]}"; do
+    for t in $c; do (( ${#PINS[@]} < CPUS )) && PINS+=("$t"); done
+  done
+  # use an SMT topology only when every selected core is fully used
+  (( TPC > 1 && CPUS % TPC == 0 )) && THREADS=$TPC
+fi
+CORES_TOPO=$(( CPUS / THREADS ))
+
+# ------------------------------------------------------------ libvirt XML ---
+step "Generating VM definition"
+UUID=$(cat /proc/sys/kernel/random/uuid)
+# random MAC with QEMU's prefix, re-rolled until no existing VM uses it
+USED_MACS=""
+if [[ $DRYRUN == no ]]; then
+  USED_MACS=$(virsh list --all --uuid 2>/dev/null | while read -r u; do
+    [[ -n $u ]] && virsh dumpxml "$u" 2>/dev/null; done |
+    grep -o "mac address='[0-9a-fA-F:]*'" | cut -d"'" -f2 | tr 'A-F' 'a-f')
+fi
+for _ in $(seq 1 100); do
+  MAC=$(printf '52:54:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+  grep -qxF "$MAC" <<<"$USED_MACS" || break
+done
+grep -qxF "$MAC" <<<"$USED_MACS" && die "could not find an unused MAC address"
+NVRAM="$NVRAM_DIR/${UUID}_VARS-pure-efi.fd"
+MEM_KIB=$(( MEM_GB * 1024 * 1024 ))
+if [[ $DRYRUN == no ]]; then
+  MACHINE=$(virsh capabilities 2>/dev/null | grep -o 'pc-q35-[0-9][0-9.]*' | sort -uV | tail -n1)
+else
+  MACHINE=pc-q35-9.2
+fi
+MACHINE=${MACHINE:-q35}
+
+# systemd credentials passed via SMBIOS type 11 (OEM strings). systemd >= 256
+# in the guest turns "systemd.extra-unit.*" into a unit file and
+# "systemd.unit-dropin.*" into a drop-in, so the guest provisions itself on
+# first boot without us ever mounting the image on the host.
+PROVISION_UNIT=$(cat <<'EOF'
+[Unit]
+Description=Unraid Arch VM first-boot provisioning
+Wants=network-online.target
+After=network-online.target pacman-init.service systemd-resolved.service
+ConditionPathExists=!/var/lib/quick_archvm/provisioned
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ImportCredential=quick_archvm.*
+ExecStart=/bin/bash %d/quick_archvm.provision
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=30min
+EOF
+)
+DROPIN=$'[Unit]\nWants=quick_archvm-provision.service\n'
+
+oem() { printf '      <entry>io.systemd.credential.binary:%s=%s</entry>\n' "$1" "$(printf '%s' "$2" | b64)"; }
+OEM_STRINGS=$(
+  oem systemd.extra-unit.quick_archvm-provision.service "$PROVISION_UNIT"
+  oem systemd.unit-dropin.multi-user.target~quick_archvm "$DROPIN"
+  oem quick_archvm.provision "$(cat "$PLUGIN_DIR/include/guest-provision.sh" 2>/dev/null || cat "$(dirname "$0")/../include/guest-provision.sh")"
+  oem quick_archvm.hostname "$HOSTNAME_G"
+  oem system.hostname "$HOSTNAME_G"
+  [[ -n $SSH_KEY ]] && oem quick_archvm.ssh-key "$SSH_KEY"
+)
+[[ $OEM_STRINGS == *quick_archvm.provision=I* ]] || die "guest-provision.sh not found"
+
+CPUTUNE=""
+if (( ${#PINS[@]} == CPUS )); then
+  CPUTUNE="  <cputune>"$'\n'
+  for (( i=0; i<CPUS; i++ )); do CPUTUNE+="    <vcpupin vcpu='$i' cpuset='${PINS[$i]}'/>"$'\n'; done
+  CPUTUNE+="  </cputune>"
+fi
+KEYMAP_ATTR=""; [[ $KEYMAP =~ ^[a-z]{2}(-[a-z]{2,3})?$ ]] && KEYMAP_ATTR=" keymap='$KEYMAP'"
+DESC="Arch Linux (official basic image${IMG_VERSION:+ $IMG_VERSION}) - default login arch/arch"
+
+XML_FILE=$(mktemp /tmp/quick_archvm-XXXXXX.xml)
+cat >"$XML_FILE" <<EOF
+<domain type='kvm'>
+  <name>$(xml_escape "$NAME")</name>
+  <uuid>$UUID</uuid>
+  <description>$(xml_escape "$DESC")</description>
+  <metadata>
+    <vmtemplate xmlns="http://unraid" name="Arch" icon="arch.png" os="arch" webui="" storage="default"/>
+  </metadata>
+  <memory unit='KiB'>$MEM_KIB</memory>
+  <currentMemory unit='KiB'>$MEM_KIB</currentMemory>
+  <memoryBacking>
+    <nosharepages/>
+  </memoryBacking>
+  <vcpu placement='static'>$CPUS</vcpu>
+$CPUTUNE
+  <sysinfo type='smbios'>
+    <oemStrings>
+$OEM_STRINGS
+    </oemStrings>
+  </sysinfo>
+  <os>
+    <type arch='x86_64' machine='$MACHINE'>hvm</type>
+    <loader readonly='yes' type='pflash' format='raw'>$OVMF_CODE</loader>
+    <nvram format='raw'>$(xml_escape "$NVRAM")</nvram>
+    <smbios mode='sysinfo'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'>
+    <topology sockets='1' dies='1' clusters='1' cores='$CORES_TOPO' threads='$THREADS'/>
+    <cache mode='passthrough'/>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='no'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='rtc' tickpolicy='catchup'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/local/sbin/qemu</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='writeback' discard='unmap'/>
+      <source file='$(xml_escape "$VDISK")'/>
+      <target dev='hdc' bus='virtio'/>
+      <serial>vdisk1</serial>
+      <boot order='1'/>
+    </disk>
+    <controller type='usb' index='0' model='qemu-xhci' ports='15'/>
+    <controller type='virtio-serial' index='0'/>
+    <interface type='bridge'>
+      <mac address='$MAC'/>
+      <source bridge='$(xml_escape "$BRIDGE")'/>
+      <model type='virtio-net'/>
+    </interface>
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <channel type='qemu-vdagent'>
+      <source>
+        <clipboard copypaste='yes'/>
+        <mouse mode='client'/>
+      </source>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='vnc' port='-1' autoport='yes' websocket='-1' listen='0.0.0.0'$KEYMAP_ATTR sharePolicy='ignore'>
+      <listen type='address' address='0.0.0.0'/>
+    </graphics>
+    <audio id='1' type='none'/>
+    <video>
+      <model type='qxl' ram='65536' vram='16384' vgamem='16384' heads='1' primary='yes'/>
+    </video>
+    <watchdog model='itco' action='reset'/>
+    <memballoon model='virtio'/>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>
+EOF
+sed -i '/^$/d' "$XML_FILE"
+
+if [[ $DRYRUN == yes ]]; then
+  say "dry run - XML written to $XML_FILE"
+  DEFINED=dry
+  exit 0
+fi
+
+# --------------------------------------------------------------- define ---
+mkdir -p -- "$NVRAM_DIR"
+cp -- "$OVMF_VARS" "$NVRAM" || die "cannot create NVRAM file"
+CREATED_NVRAM=$NVRAM
+if ! OUT=$(virsh define "$XML_FILE" 2>&1); then
+  say "$OUT"; rm -f -- "$XML_FILE"
+  die "virsh define failed"
+fi
+rm -f -- "$XML_FILE"
+DEFINED=yes
+say "VM '$NAME' defined (UUID $UUID)"
+[[ -n $CPUTUNE ]] && say "pinned to host CPUs: ${PINS[*]}"
+
+# ---------------------------------------------------------------- start ---
+if [[ $START == yes ]]; then
+  step "Starting VM"
+  if ! OUT=$(virsh start "$NAME" 2>&1); then
+    say "$OUT"
+    die "the VM was created but failed to start (see the message above); fix the cause and start it from the VMs tab"
+  fi
+  say "VM started. Waiting for the guest agent (first boot installs it, up to 10 minutes)..."
+  for (( i=0; i<120; i++ )); do
+    if virsh qemu-agent-command "$NAME" '{"execute":"guest-ping"}' &>/dev/null; then
+      printf '\n'; say "guest agent is up"
+      # The agent reports every interface, loopback first, and may come up
+      # before DHCP has finished, so retry for up to 60 s.
+      IP=""
+      for (( j=0; j<20; j++ )); do
+        IP=$(virsh domifaddr --source agent "$NAME" 2>/dev/null | vm_ipv4 "$MAC")
+        [[ -n $IP ]] && break
+        sleep 3
+      done
+      if [[ -n $IP ]]; then
+        say "IP address: $IP   (ssh arch@$IP, password: arch)"
+      else
+        say "no IP address yet (DHCP still running?) - it will show on the VMs tab once assigned"
+      fi
+      break
+    fi
+    printf '  %ds\r' $(( i*5 )); sleep 5
+  done
+  (( i < 120 )) || { printf '\n'; say "The guest agent is not up yet. That is not an error: on slow"
+                     say "connections the first-boot upgrade can take longer. It keeps retrying in the guest."; }
+fi
+
+step "Done"
+say "Default login: user 'arch', password 'arch' (change it with 'passwd')."
+exit 0
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/quick_archvm/scripts/quick_archvm_create">
+<INLINE><![CDATA[
+#!/usr/bin/php -q
+<?PHP
+/* Arch VM plugin - runs a queued "create VM" job and streams its output.
+ *
+ * Started by the web UI through openPlugin('quick_archvm_create <jobid>', ...).
+ * Unraid appends the argument "nchan" when run from the web UI; output is then
+ * published to the 'plugins' nchan channel (shown in the progress popup).
+ * Without "nchan" output goes to stdout.
+ */
+$docroot = '/usr/local/emhttp';
+$jobdir  = '/tmp/quick_archvm/jobs';
+$worker  = "$docroot/plugins/quick_archvm/scripts/quick_archvm.sh";
+
+$args  = array_slice($argv, 1);
+$nchan = end($args) === 'nchan';
+if ($nchan) {
+  array_pop($args);
+  require_once "$docroot/webGui/include/publish.php";
+}
+
+function write($msg) {
+  global $nchan;
+  if ($nchan) publish('plugins', htmlspecialchars($msg, ENT_QUOTES|ENT_SUBSTITUTE), 1, false);
+  else echo $msg;
+}
+function finish($ok) {
+  global $nchan;
+  // Always end with _DONE_: Unraid 7.x only knows _DONE_, newer releases
+  // derive the error state from our exit code.
+  if ($nchan) publish('plugins', '_DONE_', 1, false);
+  exit($ok ? 0 : 1);
+}
+
+$id = $args[0] ?? '';
+if (!preg_match('/^[a-f0-9]{16}$/', $id) || !is_file("$jobdir/$id.json")) {
+  write("Job '$id' not found. Please start again from the VMs page.\n");
+  finish(false);
+}
+$job = json_decode(file_get_contents("$jobdir/$id.json"), true);
+@unlink("$jobdir/$id.json");
+if (!is_array($job)) { write("Job file is corrupt.\n"); finish(false); }
+
+$cmd = escapeshellarg($worker)
+     . ' --name '      . escapeshellarg($job['name'])
+     . ' --cpus '      . escapeshellarg($job['cpus'])
+     . ' --memory-gb ' . escapeshellarg($job['memory'])
+     . ' --disk-gb '   . escapeshellarg($job['disk'])
+     . ' --pinning '   . escapeshellarg($job['pinning'])
+     . ($job['sshkey'] !== '' ? ' --ssh-key ' . escapeshellarg($job['sshkey']) : '')
+     . ($job['start'] ? ' --start' : '');
+
+// Read the worker's output char by char and flush on CR or LF, so progress
+// lines that only use CR are updated in place in the popup.
+$run  = popen("$cmd 2>&1", 'r');
+$line = '';
+while (($c = fgetc($run)) !== false) {
+  $line .= $c;
+  if ($c === "\n" || $c === "\r") { write($line); $line = ''; }
+}
+if ($line !== '') write("$line\n");
+$rc = pclose($run);
+finish($rc === 0);
+?>
+]]></INLINE>
+</FILE>
+
+<!-- install -->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+D=/usr/local/emhttp/plugins/quick_archvm
+C=/boot/config/plugins/quick_archvm
+chmod 755 "$D/scripts/quick_archvm_create" "$D/scripts/quick_archvm.sh"
+mkdir -p "$C"
+if [ ! -f "$C/quick_archvm.cfg" ]; then
+cat > "$C/quick_archvm.cfg" <<'CFG'
+# Arch VM plugin settings - all optional, empty = automatic
+# Image to use (the matching .SHA256 file must exist next to it)
+IMAGE_URL="https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-basic.qcow2"
+# Where VM folders are created (default: "Default VM storage path" from Settings > VM Manager)
+VM_DIR=""
+# Where the downloaded image is cached (default: <VM_DIR>/.quick_archvm-cache)
+CACHE_DIR=""
+# Network bridge (default: "Default network source" from Settings > VM Manager)
+BRIDGE=""
+# VNC keyboard layout, e.g. "de" (default: none = en-us)
+KEYMAP=""
+# Defaults shown in the dialog
+DEFAULT_CPUS="2"
+DEFAULT_MEMORY_GB="4"
+DEFAULT_DISK_GB="40"
+CPU_PINNING="auto"
+DEFAULT_SSH_KEY=""
+CFG
+fi
+echo
+echo "-----------------------------------------------------------"
+echo " quick_archvm is installed."
+echo " Use the 'Add Arch Linux VM' button on the VMs tab."
+echo " Settings: /boot/config/plugins/quick_archvm/quick_archvm.cfg"
+echo "-----------------------------------------------------------"
+echo
+]]>
+</INLINE>
+</FILE>
+
+<!-- uninstall -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+<![CDATA[
+rm -rf /usr/local/emhttp/plugins/quick_archvm /tmp/quick_archvm /var/run/quick_archvm.lock
+echo "quick_archvm removed. Settings in /boot/config/plugins/quick_archvm and the image cache"
+echo "(<VM storage path>/.quick_archvm-cache) were kept - delete them manually if unwanted."
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>

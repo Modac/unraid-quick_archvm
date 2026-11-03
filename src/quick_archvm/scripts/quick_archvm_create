@@ -1,0 +1,63 @@
+#!/usr/bin/php -q
+<?PHP
+/* Arch VM plugin - runs a queued "create VM" job and streams its output.
+ *
+ * Started by the web UI through openPlugin('quick_archvm_create <jobid>', ...).
+ * Unraid appends the argument "nchan" when run from the web UI; output is then
+ * published to the 'plugins' nchan channel (shown in the progress popup).
+ * Without "nchan" output goes to stdout.
+ */
+$docroot = '/usr/local/emhttp';
+$jobdir  = '/tmp/quick_archvm/jobs';
+$worker  = "$docroot/plugins/quick_archvm/scripts/quick_archvm.sh";
+
+$args  = array_slice($argv, 1);
+$nchan = end($args) === 'nchan';
+if ($nchan) {
+  array_pop($args);
+  require_once "$docroot/webGui/include/publish.php";
+}
+
+function write($msg) {
+  global $nchan;
+  if ($nchan) publish('plugins', htmlspecialchars($msg, ENT_QUOTES|ENT_SUBSTITUTE), 1, false);
+  else echo $msg;
+}
+function finish($ok) {
+  global $nchan;
+  // Always end with _DONE_: Unraid 7.x only knows _DONE_, newer releases
+  // derive the error state from our exit code.
+  if ($nchan) publish('plugins', '_DONE_', 1, false);
+  exit($ok ? 0 : 1);
+}
+
+$id = $args[0] ?? '';
+if (!preg_match('/^[a-f0-9]{16}$/', $id) || !is_file("$jobdir/$id.json")) {
+  write("Job '$id' not found. Please start again from the VMs page.\n");
+  finish(false);
+}
+$job = json_decode(file_get_contents("$jobdir/$id.json"), true);
+@unlink("$jobdir/$id.json");
+if (!is_array($job)) { write("Job file is corrupt.\n"); finish(false); }
+
+$cmd = escapeshellarg($worker)
+     . ' --name '      . escapeshellarg($job['name'])
+     . ' --cpus '      . escapeshellarg($job['cpus'])
+     . ' --memory-gb ' . escapeshellarg($job['memory'])
+     . ' --disk-gb '   . escapeshellarg($job['disk'])
+     . ' --pinning '   . escapeshellarg($job['pinning'])
+     . ($job['sshkey'] !== '' ? ' --ssh-key ' . escapeshellarg($job['sshkey']) : '')
+     . ($job['start'] ? ' --start' : '');
+
+// Read the worker's output char by char and flush on CR or LF, so progress
+// lines that only use CR are updated in place in the popup.
+$run  = popen("$cmd 2>&1", 'r');
+$line = '';
+while (($c = fgetc($run)) !== false) {
+  $line .= $c;
+  if ($c === "\n" || $c === "\r") { write($line); $line = ''; }
+}
+if ($line !== '') write("$line\n");
+$rc = pclose($run);
+finish($rc === 0);
+?>
